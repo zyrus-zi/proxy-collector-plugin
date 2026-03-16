@@ -54,6 +54,8 @@ The plugin has two independent modes, each with its own sources, settings, and h
 - `USER:PASS@IP:PORT`
 - `IP:PORT`
 
+> ⚠️ **Important:** To collect proxies from Telegram sources, you must be **subscribed** to the channels, chats, or topics you use as sources. Correct operation without a subscription is not guaranteed.
+
 VPN configs (`ss://`, `vless://`, `vmess://`, `trojan://`, etc.) are automatically filtered out.
 
 GitHub files support only `t.me/proxy?` and `t.me/socks?` links.
