@@ -22,12 +22,15 @@ import os
 __id__ = "proxy_collector"
 __name__ = "Proxy Collector"
 __description__ = "Собирает прокси из публичных Telegram-каналов/постов и проверяет их доступность."
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "@zyrus-zi"
 __icon__ = "exteraPlugins/1"
 __min_version__ = "11.12.0"
 
 MAX_HISTORY = 10
+MODE_NORMAL    = "normal"
+MODE_WHITELIST = "whitelist"
+
 
 # ── структура прокси ──────────────────────────────────────────────────────────
 
@@ -103,18 +106,15 @@ class HistoryEntry:
 # ── хранилище истории ─────────────────────────────────────────────────────────
 
 class HistoryStore:
-    _path = None
+
+    @staticmethod
+    def _path(mode: str) -> str:
+        return os.path.join(get_plugins_dir(), f"proxy_collector_history_{mode}.json")
 
     @classmethod
-    def _get_path(cls) -> str:
-        if cls._path is None:
-            cls._path = os.path.join(get_plugins_dir(), "proxy_collector_history.json")
-        return cls._path
-
-    @classmethod
-    def load(cls) -> List[HistoryEntry]:
+    def load(cls, mode: str) -> List[HistoryEntry]:
         try:
-            raw = read_file(cls._get_path())
+            raw = read_file(cls._path(mode))
             if not raw:
                 return []
             return [HistoryEntry.from_dict(d) for d in json.loads(raw)]
@@ -122,18 +122,17 @@ class HistoryStore:
             return []
 
     @classmethod
-    def save(cls, entries: List[HistoryEntry]):
+    def save(cls, mode: str, entries: List[HistoryEntry]):
         try:
-            write_file(cls._get_path(), json.dumps([e.to_dict() for e in entries]))
+            write_file(cls._path(mode), json.dumps([e.to_dict() for e in entries]))
         except Exception as e:
             log(f"[ProxyCollector] HistoryStore.save error: {e}")
 
     @classmethod
-    def add(cls, entry: HistoryEntry):
-        entries = cls.load()
+    def add(cls, mode: str, entry: HistoryEntry):
+        entries = cls.load(mode)
         entries.insert(0, entry)
-        entries = entries[:MAX_HISTORY]
-        cls.save(entries)
+        cls.save(mode, entries[:MAX_HISTORY])
 
 
 # ── парсер ────────────────────────────────────────────────────────────────────
@@ -144,10 +143,10 @@ class ProxyParser:
         re.IGNORECASE
     )
     RE_TG_MTPROTO = re.compile(
-        r"(?:https?://)?t\.me/proxy\?server=([^&\s]+)&port=(\d+)&secret=([a-zA-Z0-9]+)"
+        r"(?:(?:https?://)?t\.me|tg://)\/?proxy\?server=([^&\s]+)&port=(\d+)&secret=([a-zA-Z0-9]+)"
     )
     RE_TG_SOCKS = re.compile(
-        r"(?:https?://)?t\.me/socks\?server=([^&\s]+)&port=(\d+)&user=([^&\s]+)&pass=([^&\s]+)"
+        r"(?:(?:https?://)?t\.me|tg://)\/?socks\?server=([^&\s]+)&port=(\d+)&user=([^&\s]+)&pass=([^&\s]+)"
     )
     RE_MTPROTO_TEXT = re.compile(
         r"Server:\s*([\w.\-]+).*?Port:\s*(\d+).*?Secret:\s*(\w+)", re.DOTALL
@@ -159,6 +158,11 @@ class ProxyParser:
         r"\b([^:@\s]+):([^:@\s]+)@((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b"
     )
     RE_IP_PORT = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b")
+
+    # Только TG-ссылки — для GitHub файлов
+    RE_TG_ONLY = re.compile(
+        r"(?:https?://)?t\.me/(?:proxy|socks)\?[^\s]+"
+    )
 
     @classmethod
     def _clean(cls, text: str) -> str:
@@ -194,8 +198,56 @@ class ProxyParser:
 
         return proxies
 
+    @classmethod
+    def parse_tg_only(cls, text: str) -> List[ProxyItem]:
+        """Только t.me/proxy? и t.me/socks? — для файлов GitHub."""
+        proxies, seen = [], set()
 
-# ── фетчер ────────────────────────────────────────────────────────────────────
+        def add(item: ProxyItem):
+            key = f"{item.host}:{item.port}"
+            if key not in seen:
+                seen.add(key)
+                proxies.append(item)
+
+        for m in cls.RE_TG_MTPROTO.finditer(text):
+            add(ProxyItem(host=m.group(1), port=int(m.group(2)), secret=m.group(3), protocol="MTPROTO"))
+        for m in cls.RE_TG_SOCKS.finditer(text):
+            add(ProxyItem(host=m.group(1), port=int(m.group(2)), user=m.group(3), password=m.group(4), protocol="SOCKS5"))
+
+        return proxies
+
+
+# ── GitHub фетчер ─────────────────────────────────────────────────────────────
+
+class GitHubFetcher:
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    @classmethod
+    def fetch(cls, url: str) -> List[ProxyItem]:
+        url = url.strip()
+        if not url:
+            return []
+        # Конвертируем github.com/user/repo/blob/... → raw.githubusercontent.com
+        url = re.sub(
+            r"https?://github\.com/([^/]+/[^/]+)/blob/(.+)",
+            r"https://raw.githubusercontent.com/\1/\2",
+            url
+        )
+        try:
+            r = requests.get(url, headers=cls.HEADERS, timeout=15)
+            r.raise_for_status()
+            proxies = []
+            for line in r.text.splitlines():
+                line = htmllib.unescape(line.strip())
+                found = ProxyParser.parse_tg_only(line)
+                proxies.extend(found)
+            return proxies
+        except Exception as e:
+            log(f"[ProxyCollector] GitHubFetcher error for {url}: {e}")
+            return []
+
+
+# ── фетчер Telegram ───────────────────────────────────────────────────────────
 
 class TelegramFetcher:
     HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -507,108 +559,116 @@ class ProxyChecker:
             return ""
 
 
-# ── плагин ────────────────────────────────────────────────────────────────────
+# ── контроллер режима ─────────────────────────────────────────────────────────
 
-class ProxyCollectorPlugin(BasePlugin):
+class ModeController:
+    """Хранит состояние и логику для одного режима (normal / whitelist)."""
 
-    def on_plugin_load(self):
+    def __init__(self, mode: str, plugin: "ProxyCollectorPlugin"):
+        self.mode   = mode
+        self.plugin = plugin
+
         self._running = False
         self._cancel  = False
         self._results: List[ProxyItem] = []
         self._status  = "Ожидание"
 
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.DRAWER_MENU,
-            text="Proxy Collector",
-            subtext="Сбор и проверка прокси",
-            icon="msg_proxy_settings",
-            on_click=self._on_drawer_click,
-        ))
+    # Ключи настроек с префиксом режима
+    def _k(self, key: str) -> str:
+        return f"{self.mode}_{key}"
 
-    # ── настройки ─────────────────────────────────────────────────────────────
+    def get(self, key: str, default=None):
+        return self.plugin.get_setting(self._k(key), default)
 
-    def _on_drawer_click(self, context):
-        def _run():
-            PC  = find_class("com.exteragram.messenger.plugins.PluginsController")
-            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+    def _reload(self):
+        self.plugin.set_setting(self._k("_ts"), str(time.time()), reload_settings=True)
 
-            # Вариант 1: inst.plugins.get(id) + presentFragment
-            if PC and PSA:
-                try:
-                    inst = PC.getInstance()
-                    if inst is not None and hasattr(inst, "plugins"):
-                        for pid in [__id__, "proxy_collector"]:
-                            try:
-                                plugin_obj = inst.plugins.get(pid)
-                            except Exception:
-                                plugin_obj = None
-                            if plugin_obj is not None:
-                                frag = get_last_fragment()
-                                if frag is not None:
-                                    frag.presentFragment(PSA(plugin_obj))
-                                    return
-                except Exception:
-                    pass
+    def _get_days_limit(self) -> int:
+        preset = self.get("days_preset", 2)
+        mapping = {0: 1, 1: 3, 2: 7, 3: 14, 4: 30, 5: 0}
+        if preset in mapping:
+            return mapping[preset]
+        try:
+            return max(1, int(self.get("days_custom", "7")))
+        except ValueError:
+            return 7
 
-            # Вариант 2: PC.openPluginSettings(id)
-            if PC:
-                for pid in [__id__, "proxy_collector"]:
-                    try:
-                        if bool(PC.openPluginSettings(pid)):
-                            return
-                    except Exception:
-                        pass
+    # ── страница настроек режима ───────────────────────────────────────────────
 
-            # Вариант 3: PC.getInstance().openPluginSettings(id, frag)
-            if PC:
-                try:
-                    frag = get_last_fragment()
-                    if frag:
-                        PC.getInstance().openPluginSettings(__id__, frag)
-                except Exception:
-                    pass
+    def create_page(self) -> List[Any]:
+        label = "Обычные прокси" if self.mode == MODE_NORMAL else "Прокси с обходом белых списков"
+        use_sources = self.get("use_sources", True)
+        use_github  = self.get("use_github", False)
 
-        run_on_ui_thread(_run)
+        items = [Header(text=label)]
 
-    def create_settings(self) -> List[Any]:
-        items = [
-            Header(text="Сбор прокси"),
-            Input(
-                key="sources",
-                text="Источники",
-                default="",
-                subtext="Ссылки на каналы, чаты, посты или топики — через пробел или с новой строки.",
+        if self.mode == MODE_WHITELIST:
+            items.append(Divider(text="⚠️ Прокси с обходом белых списков необходимо проверять ТОЛЬКО при включённых белых списках. Проверка без активных белых списков даст некорректные результаты — рабочие прокси могут оказаться мёртвыми."))
+
+        items += [
+            Header(text="Telegram"),
+            Switch(
+                key=self._k("use_sources"),
+                text="Источники Telegram",
+                subtext="Собирать прокси из каналов, чатов, постов и топиков.",
+                default=True,
                 icon="msg_link",
             ),
-            Selector(
-                key="days_preset",
+        ]
+
+        if use_sources:
+            items.append(Input(
+                key=self._k("sources"),
+                text="Источники",
+                default="",
+                subtext="Ссылки через пробел или с новой строки.",
+                icon="msg_link",
+            ))
+            items.append(Selector(
+                key=self._k("days_preset"),
                 text="Глубина поиска",
                 items=["1 день", "3 дня", "7 дней", "14 дней", "30 дней", "За всё время", "Вручную"],
                 default=2,
                 icon="msg_recent",
-            ),
-        ]
+            ))
+            if self.get("days_preset", 2) == 6:
+                items.append(Input(
+                    key=self._k("days_custom"),
+                    text="Количество дней",
+                    default="7",
+                    subtext="Введите число дней вручную.",
+                    icon="msg_recent",
+                ))
 
-        if self.get_setting("days_preset", 2) == 6:
+        items.append(Header(text="GitHub"))
+        items.append(Switch(
+            key=self._k("use_github"),
+            text="Файл на GitHub",
+            subtext="Загружать прокси из файла на GitHub.",
+            default=False,
+            icon="msg_download",
+        ))
+
+        if use_github:
             items.append(Input(
-                key="days_custom",
-                text="Количество дней",
-                default="7",
-                subtext="Введите число дней вручную.",
-                icon="msg_recent",
+                key=self._k("github_url"),
+                text="Ссылки на файлы",
+                default="",
+                subtext="Ссылки на файлы GitHub с прокси — каждая с новой строки.",
+                icon="msg_download",
             ))
 
         items += [
             Header(text="Проверка"),
             Input(
-                key="timeout",
+                key=self._k("timeout"),
                 text="Таймаут (сек)",
                 default="5",
                 subtext="Максимальное время ожидания ответа от прокси.",
                 icon="msg2_autodelete",
             ),
             Switch(
-                key="check_country",
+                key=self._k("check_country"),
                 text="Определять страну",
                 subtext="Дополнительный запрос к ipwho.is для каждого живого прокси.",
                 default=True,
@@ -640,16 +700,15 @@ class ProxyCollectorPlugin(BasePlugin):
         if not self._running and self._status != "Ожидание":
             items.append(Divider(text=self._status))
 
-        alive = [p for p in self._results if p.is_alive]
-        dead  = [p for p in self._results if not p.is_alive]
-
         if self._results:
+            alive = [p for p in self._results if p.is_alive]
+            dead  = [p for p in self._results if not p.is_alive]
             items.append(Text(
                 text=f"Живых: {len(alive)}   Мёртвых: {len(dead)}",
                 icon="msg_info",
             ))
 
-        history = HistoryStore.load()
+        history = HistoryStore.load(self.mode)
         if history:
             items += [
                 Divider(),
@@ -668,22 +727,17 @@ class ProxyCollectorPlugin(BasePlugin):
 
         return items
 
+    # ── история ───────────────────────────────────────────────────────────────
+
     def _create_history_page(self) -> List[Any]:
-        history = HistoryStore.load()
+        history = HistoryStore.load(self.mode)
         if not history:
-            return [
-                Header(text="История"),
-                Text(text="История пуста.", icon="msg_info"),
-            ]
+            return [Header(text="История"), Text(text="История пуста.", icon="msg_info")]
 
         items = [
             Header(text="История сборов"),
-            Text(
-                text="Очистить всю историю",
-                red=True,
-                icon="msg_delete",
-                on_click=self._on_clear_history,
-            ),
+            Text(text="Очистить всю историю", red=True, icon="msg_delete",
+                 on_click=self._on_clear_history),
             Divider(),
         ]
         for entry in history:
@@ -694,9 +748,7 @@ class ProxyCollectorPlugin(BasePlugin):
                 create_sub_fragment=lambda e=entry: self._create_entry_page(e),
             ))
             items.append(Text(
-                text="Удалить",
-                red=True,
-                icon="msg_delete",
+                text="Удалить", red=True, icon="msg_delete",
                 on_click=lambda v, ts=entry.timestamp: self._on_delete_entry(ts),
             ))
         return items
@@ -706,10 +758,7 @@ class ProxyCollectorPlugin(BasePlugin):
         items = [
             Header(text=f"Сбор  {dt}"),
             Text(text=f"Источники: {entry.sources}", icon="msg_link"),
-            Text(
-                text=f"Живых: {len(entry.alive)}   Мёртвых: {entry.dead_count}",
-                icon="msg_info",
-            ),
+            Text(text=f"Живых: {len(entry.alive)}   Мёртвых: {entry.dead_count}", icon="msg_info"),
             Divider(),
         ]
         if entry.alive:
@@ -717,13 +766,238 @@ class ProxyCollectorPlugin(BasePlugin):
                 text="Открыть список прокси",
                 accent=True,
                 icon="msg_forward",
-                on_click=lambda v, e=entry: self._open_proxy_list_in_browser(e),
+                on_click=lambda v, e=entry: self.plugin._open_proxy_list_in_browser(e),
             ))
             for p in sorted(entry.alive, key=lambda p: p.ping_ms):
                 items.append(Text(text=p.result_line(), icon="msg_forward"))
         else:
             items.append(Text(text="Живых прокси нет.", icon="msg_info"))
         return items
+
+    def _on_clear_history(self, view):
+        HistoryStore.save(self.mode, [])
+        self._reload()
+        BulletinHelper.show_info("История очищена")
+
+    def _on_delete_entry(self, timestamp: int):
+        history = HistoryStore.load(self.mode)
+        HistoryStore.save(self.mode, [e for e in history if e.timestamp != timestamp])
+        self._reload()
+        BulletinHelper.show_info("Сбор удалён")
+
+    # ── запуск ────────────────────────────────────────────────────────────────
+
+    def _on_cancel_click(self, view):
+        self._cancel = True
+        self._status = "Отмена..."
+        self._reload()
+
+    def _on_start_click(self, view):
+        if self._running:
+            return
+        use_sources = self.get("use_sources", True)
+        use_github  = self.get("use_github", False)
+        sources    = self.get("sources", "").strip() if use_sources else ""
+        github_url = self.get("github_url", "").strip() if use_github else ""
+        if not sources and not github_url:
+            BulletinHelper.show_error("Включите и заполните хотя бы один источник")
+            return
+        self._cancel = False
+        threading.Thread(
+            target=self._run,
+            args=(sources, github_url, self._get_days_limit()),
+            daemon=True
+        ).start()
+
+    def _run(self, sources_raw: str, github_url: str, days_limit: int):
+        self._running = True
+        self._results = []
+        self._status  = "Сбор прокси..."
+        self._reload()
+
+        try:
+            timeout = max(1, min(int(self.get("timeout", "5")), 30))
+        except ValueError:
+            timeout = 5
+
+        all_proxies: List[ProxyItem] = []
+
+        # Сбор из Telegram-источников
+        raw_urls = re.findall(r"(?:https?://)?t\.me/\S+", sources_raw)
+        urls = [re.sub(r"^https?://", "", u) for u in raw_urls]
+        total = len(urls)
+
+        for i, url in enumerate(urls):
+            if self._cancel:
+                break
+            self._status = f"Сбор {i+1}/{total}: {url}..."
+            self._reload()
+            try:
+                all_proxies.extend(TelegramFetcher.fetch(url, days_limit))
+            except Exception as e:
+                log(f"[ProxyCollector] fetch error {url}: {e}")
+
+        # Сбор из GitHub файла
+        if not self._cancel and github_url:
+            github_urls = [u.strip() for u in github_url.splitlines() if u.strip()]
+            for i, gurl in enumerate(github_urls):
+                if self._cancel:
+                    break
+                self._status = f"Загрузка файла GitHub {i+1}/{len(github_urls)}..."
+                self._reload()
+                try:
+                    all_proxies.extend(GitHubFetcher.fetch(gurl))
+                except Exception as e:
+                    log(f"[ProxyCollector] github fetch error {gurl}: {e}")
+
+        if self._cancel:
+            self._finish_cancelled()
+            return
+
+        # Дедупликация
+        seen, unique = set(), []
+        for p in all_proxies:
+            key = f"{p.host}:{p.port}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(p)
+
+        if not unique:
+            self._status = "Прокси не найдены"
+            self._running = False
+            self._reload()
+            return
+
+        # Проверка
+        self._status = f"Проверка {len(unique)} прокси..."
+        self._reload()
+
+        results = [None] * len(unique)
+        lock = threading.Lock()
+
+        def check_worker(idx: int, proxy: ProxyItem):
+            if self._cancel:
+                return
+            result = ProxyChecker.check(proxy, timeout)
+            if not self.get("check_country", True):
+                result.country = ""
+            with lock:
+                results[idx] = result
+
+        for batch_start in range(0, len(unique), 10):
+            if self._cancel:
+                break
+            batch = unique[batch_start:batch_start + 10]
+            workers = [
+                threading.Thread(target=check_worker, args=(batch_start + j, p))
+                for j, p in enumerate(batch)
+            ]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            done = batch_start + len(batch)
+            self._status = f"Проверено {done}/{len(unique)}..."
+            self._reload()
+
+        if self._cancel:
+            self._finish_cancelled()
+            return
+
+        self._results = [r for r in results if r is not None]
+        alive = [p for p in self._results if p.is_alive]
+        dead  = [p for p in self._results if not p.is_alive]
+
+        self._status = f"Готово: {len(alive)} живых, {len(dead)} мёртвых"
+        self._running = False
+        self._reload()
+
+        sources_label = " | ".join(filter(None, [sources_raw[:100], github_url[:80]]))
+        HistoryStore.add(self.mode, HistoryEntry(
+            timestamp=int(time.time()),
+            alive=alive,
+            dead_count=len(dead),
+            sources=sources_label[:200],
+        ))
+
+    def _finish_cancelled(self):
+        self._status  = "Отменено"
+        self._running = False
+        self._cancel  = False
+        self._reload()
+
+
+# ── основной класс плагина ────────────────────────────────────────────────────
+
+class ProxyCollectorPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self._mode_normal    = ModeController(MODE_NORMAL, self)
+        self._mode_whitelist = ModeController(MODE_WHITELIST, self)
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text="Proxy Collector",
+            subtext="Сбор и проверка прокси",
+            icon="msg_proxy_settings",
+            on_click=self._on_drawer_click,
+        ))
+
+    def _on_drawer_click(self, context):
+        def _run():
+            PC  = find_class("com.exteragram.messenger.plugins.PluginsController")
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+            if PC and PSA:
+                try:
+                    inst = PC.getInstance()
+                    if inst is not None and hasattr(inst, "plugins"):
+                        for pid in [__id__, "proxy_collector"]:
+                            try:
+                                plugin_obj = inst.plugins.get(pid)
+                            except Exception:
+                                plugin_obj = None
+                            if plugin_obj is not None:
+                                frag = get_last_fragment()
+                                if frag is not None:
+                                    frag.presentFragment(PSA(plugin_obj))
+                                    return
+                except Exception:
+                    pass
+            if PC:
+                for pid in [__id__, "proxy_collector"]:
+                    try:
+                        if bool(PC.openPluginSettings(pid)):
+                            return
+                    except Exception:
+                        pass
+            if PC:
+                try:
+                    frag = get_last_fragment()
+                    if frag:
+                        PC.getInstance().openPluginSettings(__id__, frag)
+                except Exception:
+                    pass
+        run_on_ui_thread(_run)
+
+    # ── главная страница: две кнопки ──────────────────────────────────────────
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Proxy Collector"),
+            Text(
+                text="Обычные прокси",
+                icon="msg_proxy_on",
+                create_sub_fragment=self._mode_normal.create_page,
+            ),
+            Text(
+                text="Прокси с обходом белых списков",
+                icon="msg_proxy_on",
+                create_sub_fragment=self._mode_whitelist.create_page,
+            ),
+            Divider(text="⚠️ Для корректной работы с Telegram-источниками необходимо быть подписанным на используемые каналы, чаты и топики. Корректная работа без подписки не гарантируется."),
+        ]
+
+    # ── браузер (общий для обоих режимов) ─────────────────────────────────────
 
     def _open_proxy_list_in_browser(self, entry: HistoryEntry):
         def serve_and_open():
@@ -736,7 +1010,6 @@ class ProxyCollectorPlugin(BasePlugin):
                 html = self._build_proxy_html(entry, dt)
                 html_bytes = html.encode("utf-8")
 
-                # Находим свободный порт
                 with _socket.socket() as s:
                     s.bind(("", 0))
                     port = s.getsockname()[1]
@@ -772,8 +1045,6 @@ class ProxyCollectorPlugin(BasePlugin):
                             log(f"[ProxyCollector] Intent fallback error: {e2}")
 
                 run_on_ui_thread(open_browser)
-
-                # Обслуживаем один запрос (браузер загрузит страницу) — потом закрываем
                 httpd.handle_request()
                 httpd.server_close()
 
@@ -785,28 +1056,23 @@ class ProxyCollectorPlugin(BasePlugin):
 
     def _build_proxy_html(self, entry: HistoryEntry, dt: str) -> str:
         alive = sorted(entry.alive, key=lambda p: p.ping_ms)
-
         rows = []
         for p in alive:
             link = p.tg_link()
             ping = f"{p.ping_ms}ms" if p.is_alive else "—"
             country = p.country or "—"
             is_tg_link = link.startswith("https://t.me/")
-            cell = (
+            rows.append(
                 f'<tr>'
                 f'<td class="ping ok">{ping}</td>'
                 f'<td class="proto">{p.protocol}</td>'
                 f'<td class="country">{country}</td>'
                 f'<td class="addr">'
-                + (f'<a href="{link}">{link}</a>' if is_tg_link else f'{link}')
-                + f'</td>'
-                f'</tr>'
+                + (f'<a href="{link}">{link}</a>' if is_tg_link else link)
+                + f'</td></tr>'
             )
-            rows.append(cell)
-
         rows_html = "\n".join(rows)
         sources_escaped = entry.sources.replace("&", "&amp;").replace("<", "&lt;")
-
         return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -823,12 +1089,10 @@ class ProxyCollectorPlugin(BasePlugin):
   .badge.alive {{ background: #1a3a1a; color: #4caf50; }}
   .badge.dead {{ background: #3a1a1a; color: #f44336; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-  th {{ text-align: left; padding: 8px 10px; color: #888; font-weight: 600;
-        font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #222; }}
-  td {{ padding: 10px 10px; border-bottom: 1px solid #1a1a1a; vertical-align: middle; }}
+  th {{ text-align: left; padding: 8px 10px; color: #888; font-weight: 600; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #222; }}
+  td {{ padding: 10px; border-bottom: 1px solid #1a1a1a; vertical-align: middle; }}
   tr:hover td {{ background: #181818; }}
-  td.ping {{ font-weight: 700; width: 60px; }}
-  td.ping.ok {{ color: #4caf50; }}
+  td.ping {{ font-weight: 700; width: 60px; color: #4caf50; }}
   td.proto {{ color: #888; width: 80px; font-size: 11px; }}
   td.country {{ width: 120px; }}
   td.addr a {{ color: #5db0f5; text-decoration: none; word-break: break-all; }}
@@ -845,150 +1109,7 @@ class ProxyCollectorPlugin(BasePlugin):
 </div>
 <table>
   <thead><tr><th>Пинг</th><th>Тип</th><th>Страна</th><th>Адрес</th></tr></thead>
-  <tbody>
-{rows_html}
-  </tbody>
+  <tbody>{rows_html}</tbody>
 </table>
 </body>
 </html>"""
-
-    def _on_clear_history(self, view):
-        HistoryStore.save([])
-        self.set_setting("_ts", "cleared", reload_settings=True)
-        BulletinHelper.show_info("История очищена")
-
-    def _on_delete_entry(self, timestamp: int):
-        history = HistoryStore.load()
-        history = [e for e in history if e.timestamp != timestamp]
-        HistoryStore.save(history)
-        self.set_setting("_ts", "deleted", reload_settings=True)
-        BulletinHelper.show_info("Сбор удалён")
-
-    # ── вспомогательные ───────────────────────────────────────────────────────
-
-    def _get_days_limit(self) -> int:
-        preset = self.get_setting("days_preset", 2)
-        mapping = {0: 1, 1: 3, 2: 7, 3: 14, 4: 30, 5: 0}
-        if preset in mapping:
-            return mapping[preset]
-        try:
-            return max(1, int(self.get_setting("days_custom", "7")))
-        except ValueError:
-            return 7
-
-    def _on_cancel_click(self, view):
-        self._cancel = True
-        self._status = "Отмена..."
-        self.set_setting("_ts", "cancel", reload_settings=True)
-
-    def _on_start_click(self, view):
-        if self._running:
-            return
-        sources = self.get_setting("sources", "").strip()
-        if not sources:
-            BulletinHelper.show_error("Укажите хотя бы один источник")
-            return
-        self._cancel = False
-        threading.Thread(
-            target=self._run, args=(sources, self._get_days_limit()), daemon=True
-        ).start()
-
-    # ── основной цикл ─────────────────────────────────────────────────────────
-
-    def _run(self, sources_raw: str, days_limit: int):
-        self._running = True
-        self._results = []
-        self._status  = "Сбор прокси..."
-        self.set_setting("_ts", "1", reload_settings=True)
-
-        try:
-            timeout = max(1, min(int(self.get_setting("timeout", "5")), 30))
-        except ValueError:
-            timeout = 5
-
-        raw_urls = re.findall(r"(?:https?://)?t\.me/\S+", sources_raw)
-        urls = [re.sub(r"^https?://", "", u) for u in raw_urls]
-        all_proxies: List[ProxyItem] = []
-
-        for i, url in enumerate(urls):
-            if self._cancel:
-                break
-            self._status = f"Сбор {i+1}/{len(urls)}: {url}..."
-            self.set_setting("_ts", str(i), reload_settings=True)
-            try:
-                all_proxies.extend(TelegramFetcher.fetch(url, days_limit))
-            except Exception as e:
-                log(f"[ProxyCollector] fetch error {url}: {e}")
-
-        if self._cancel:
-            self._finish_cancelled()
-            return
-
-        seen, unique = set(), []
-        for p in all_proxies:
-            key = f"{p.host}:{p.port}"
-            if key not in seen:
-                seen.add(key)
-                unique.append(p)
-
-        if not unique:
-            self._status = "Прокси не найдены"
-            self._running = False
-            self.set_setting("_ts", "done", reload_settings=True)
-            return
-
-        self._status = f"Проверка {len(unique)} прокси..."
-        self.set_setting("_ts", "checking", reload_settings=True)
-
-        results = [None] * len(unique)
-        lock = threading.Lock()
-
-        def check_worker(idx: int, proxy: ProxyItem):
-            if self._cancel:
-                return
-            result = ProxyChecker.check(proxy, timeout)
-            if not self.get_setting("check_country", True):
-                result.country = ""
-            with lock:
-                results[idx] = result
-
-        for batch_start in range(0, len(unique), 10):
-            if self._cancel:
-                break
-            batch = unique[batch_start:batch_start + 10]
-            workers = [
-                threading.Thread(target=check_worker, args=(batch_start + j, p))
-                for j, p in enumerate(batch)
-            ]
-            for w in workers:
-                w.start()
-            for w in workers:
-                w.join()
-            done = batch_start + len(batch)
-            self._status = f"Проверено {done}/{len(unique)}..."
-            self.set_setting("_ts", str(done), reload_settings=True)
-
-        if self._cancel:
-            self._finish_cancelled()
-            return
-
-        self._results = [r for r in results if r is not None]
-        alive = [p for p in self._results if p.is_alive]
-        dead  = [p for p in self._results if not p.is_alive]
-
-        self._status = f"Готово: {len(alive)} живых, {len(dead)} мёртвых"
-        self._running = False
-        self.set_setting("_ts", "done", reload_settings=True)
-
-        HistoryStore.add(HistoryEntry(
-            timestamp=int(time.time()),
-            alive=alive,
-            dead_count=len(dead),
-            sources=sources_raw[:200],
-        ))
-
-    def _finish_cancelled(self):
-        self._status  = "Отменено"
-        self._running = False
-        self._cancel  = False
-        self.set_setting("_ts", "done", reload_settings=True)
