@@ -12,9 +12,9 @@ A plugin for [exteraGram](https://exteragram.app) and [AyuGram](https://ayugram.
 - ⚡ Checks proxies using the same native method Telegram uses internally
 - 🌍 Optional country detection via [ipwho.is](https://ipwho.is)
 - 📅 Configurable search depth: 1 day to all time, or a custom number of days
-- 📁 Load proxies from GitHub files (one link per line)
+- 📁 Load proxies from GitHub files or a local TXT file on the device
 - 🗂 History of the last 10 collection runs, saved on disk
-- 🌐 Results viewable as a formatted HTML page in the built-in browser
+- 🌐 Results viewable as a formatted HTML page in the built-in browser — with filters, export to TG, and send to Proxy Vault
 - 🛑 Cancel button during collection and checking
 - 📌 Quick access button in the side drawer menu
 
@@ -39,16 +39,20 @@ The plugin has two independent modes, each with its own sources, settings, and h
 |---|---|
 | Channel | `t.me/proxy_channel` |
 | Group chat | `t.me/GoodbyeWLChat` |
-| Specific post | `t.me/channel/123` |
+| Specific post | `t.me/channel/910` |
 | Forum topic | `t.me/LowiKForum/10805` |
+| Post in a topic | `t.me/LowiKForum/10805/32871` |
 | GitHub file | `github.com/user/repo/blob/main/proxies.txt` |
+| Local TXT file | `/storage/emulated/0/Download/proxies.txt` |
 
 ---
 
 ## Supported Proxy Formats
 
 - `https://t.me/proxy?server=...&port=...&secret=...` (MTProto)
+- `tg://proxy?server=...&port=...&secret=...` (MTProto, converted automatically)
 - `https://t.me/socks?server=...&port=...&user=...&pass=...` (SOCKS5)
+- `tg://socks?server=...&port=...&user=...&pass=...` (SOCKS5, converted automatically)
 - `Server: ... Port: ... Secret: ...` (text block)
 - `IP:PORT:USER:PASS`
 - `USER:PASS@IP:PORT`
@@ -58,7 +62,18 @@ The plugin has two independent modes, each with its own sources, settings, and h
 
 VPN configs (`ss://`, `vless://`, `vmess://`, `trojan://`, etc.) are automatically filtered out.
 
-GitHub files support only `t.me/proxy?` and `t.me/socks?` links.
+GitHub and local TXT files support only `t.me/proxy?` and `t.me/socks?` links (including `tg://` variants).
+
+---
+
+## Results page (browser)
+
+After collection, results open in the built-in browser with:
+
+- **Ping filter** — show only proxies below a specified latency
+- **📲 Add to Telegram** — add proxies to TG with optional ping limit
+- **🗄 Send to Proxy Vault** — send to an existing or new tab in [Proxy Vault](https://github.com/zyrus-zi/proxy-vault-plugin)
+- **📄 Export to TXT** — send a TXT file with all proxies to Saved Messages
 
 ---
 
@@ -86,6 +101,7 @@ Each mode has its own independent settings:
 | Telegram sources | Links to channels, chats, posts or topics | — |
 | Search depth | How far back to look for posts | 7 days |
 | GitHub files | Links to GitHub files with proxies (one per line) | — |
+| Local TXT file | Full path to a TXT file on the device | — |
 | Check timeout | Max wait time per proxy (sec) | 5 |
 | Detect country | Extra request to ipwho.is per live proxy | ✅ On |
 
@@ -97,6 +113,12 @@ Each mode has its own independent settings:
 |---|---|
 | exteraGram | ✅ |
 | AyuGram | ✅ |
+
+---
+
+## Related plugins
+
+- [Proxy Vault](https://github.com/zyrus-zi/proxy-vault-plugin) — store and manage proxies in named tabs
 
 ---
 
